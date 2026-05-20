@@ -464,6 +464,60 @@ def performance_metrics(r, risk_free_rate):
     return [annual_return, annual_vol, sharpe, max_dd]
 
 
+def calculate_portfolio_returns(returns, weights):
+    weights = pd.to_numeric(weights, errors="coerce")
+    returns = returns.reindex(columns=weights.index).replace([np.inf, -np.inf], np.nan)
+
+    usable_assets = returns.columns[
+        returns.notna().any() &
+        weights.replace([np.inf, -np.inf], np.nan).notna()
+    ]
+
+    if len(usable_assets) == 0:
+        return pd.Series(dtype=float)
+
+    usable_weights = weights.loc[usable_assets]
+    usable_weights = usable_weights[usable_weights > 0]
+
+    if usable_weights.empty or usable_weights.sum() <= 0:
+        return pd.Series(dtype=float)
+
+    usable_weights = usable_weights / usable_weights.sum()
+    usable_returns = returns.loc[:, usable_weights.index]
+    portfolio_returns = usable_returns.mul(usable_weights, axis=1).sum(axis=1, min_count=1)
+
+    return portfolio_returns.replace([np.inf, -np.inf], np.nan).dropna()
+
+
+def calculate_growth_and_drawdown(portfolio_returns):
+    if portfolio_returns.empty:
+        empty_series = pd.Series(dtype=float)
+        return empty_series, empty_series
+
+    growth = (1 + portfolio_returns).cumprod() * 10000
+    drawdown = growth / growth.cummax() - 1
+
+    return growth, drawdown
+
+
+def get_return_series(returns, ticker):
+    if ticker not in returns.columns:
+        return pd.Series(dtype=float)
+
+    return returns[ticker].replace([np.inf, -np.inf], np.nan).dropna()
+
+
+def prepare_chart_dataframe(data):
+    chart_df = pd.DataFrame(data)
+    chart_df = chart_df.apply(pd.to_numeric, errors="coerce")
+
+    return chart_df.dropna(how="all")
+
+
+def has_chart_data(chart_df):
+    return not chart_df.empty and chart_df.notna().any().any()
+
+
 def is_finite_number(value):
     return pd.notna(value) and np.isfinite(value)
 
@@ -570,10 +624,8 @@ if page == "Portfolio Analysis":
 
     weights = weights / weights.sum()
 
-    aligned_base_returns = returns.reindex(columns=tickers).replace([np.inf, -np.inf], np.nan).dropna()
-    portfolio_returns = aligned_base_returns.dot(weights)
-    growth = (1 + portfolio_returns).cumprod() * 10000
-    drawdown = growth / growth.cummax() - 1
+    portfolio_returns = calculate_portfolio_returns(returns, weights)
+    growth, drawdown = calculate_growth_and_drawdown(portfolio_returns)
 
     rolling_vol = portfolio_returns.rolling(63).std() * np.sqrt(252)
     rolling_return = portfolio_returns.rolling(252).apply(lambda x: (1 + x).prod() - 1)
@@ -865,37 +917,38 @@ if page == "Portfolio Analysis":
         benchmark_tickers = ["SPY", "AGG"]
         benchmark_returns = load_benchmark_returns(benchmark_tickers)
 
-        aligned_returns = returns.reindex(columns=weights.index).replace([np.inf, -np.inf], np.nan).dropna()
-        portfolio_returns_bt = aligned_returns.dot(weights)
+        portfolio_returns_bt = calculate_portfolio_returns(returns, weights)
 
-        spy_returns = benchmark_returns["SPY"]
-
-        sixty_forty_returns = (
-            benchmark_returns["SPY"] * 0.60 +
-            benchmark_returns["AGG"] * 0.40
+        spy_returns = get_return_series(benchmark_returns, "SPY")
+        sixty_forty_returns = calculate_portfolio_returns(
+            benchmark_returns,
+            pd.Series({"SPY": 0.60, "AGG": 0.40})
         )
 
         portfolio_growth = (1 + portfolio_returns_bt).cumprod() * 10000
         spy_growth = (1 + spy_returns).cumprod() * 10000
         sixty_growth = (1 + sixty_forty_returns).cumprod() * 10000
 
-        growth_df = pd.DataFrame({
+        growth_df = prepare_chart_dataframe({
             "Selected Portfolio": portfolio_growth,
             "SPY": spy_growth,
             "60/40 Portfolio": sixty_growth
-        }).dropna()
+        })
 
-        fig_growth = px.line(
-            growth_df,
-            title="Growth of $10,000",
-            color_discrete_map={
-        "Selected Portfolio": "#38BDF8",
-        "SPY": "#22C55E",
-        "60/40 Portfolio": "#F97316"
-    }
-)
+        if has_chart_data(growth_df):
+            fig_growth = px.line(
+                growth_df,
+                title="Growth of $10,000",
+                color_discrete_map={
+            "Selected Portfolio": "#38BDF8",
+            "SPY": "#22C55E",
+            "60/40 Portfolio": "#F97316"
+        }
+    )
 
-        st.plotly_chart(fig_growth, use_container_width=True)
+            st.plotly_chart(fig_growth, use_container_width=True)
+        else:
+            st.warning("Historical growth data is temporarily unavailable. Try refreshing the app.")
 
         metrics_df = pd.DataFrame(
             {
@@ -985,25 +1038,31 @@ if page == "Portfolio Analysis":
 
         drawdown_comparison = growth_df / growth_df.cummax() - 1
 
-        fig_drawdown = px.line(
-            drawdown_comparison,
-            title="Drawdown Comparison",
-            color_discrete_map=COLOR_MAP
-        )
+        if has_chart_data(drawdown_comparison):
+            fig_drawdown = px.line(
+                drawdown_comparison,
+                title="Drawdown Comparison",
+                color_discrete_map=COLOR_MAP
+            )
 
-        st.plotly_chart(fig_drawdown, use_container_width=True)
+            st.plotly_chart(fig_drawdown, use_container_width=True)
+        else:
+            st.warning("Drawdown comparison data is temporarily unavailable. Try refreshing the app.")
         st.markdown("---")
         st.subheader("Rolling Volatility Comparison")
 
         rolling_vol_comparison = growth_df.pct_change().rolling(63).std() * np.sqrt(252)
 
-        fig_rolling_vol = px.line(
-            rolling_vol_comparison,
-            title="Rolling 3-Month Annualized Volatility",
-            color_discrete_map=COLOR_MAP
-        )
+        if has_chart_data(rolling_vol_comparison):
+            fig_rolling_vol = px.line(
+                rolling_vol_comparison,
+                title="Rolling 3-Month Annualized Volatility",
+                color_discrete_map=COLOR_MAP
+            )
         
-        st.plotly_chart(fig_rolling_vol, use_container_width=True)
+            st.plotly_chart(fig_rolling_vol, use_container_width=True)
+        else:
+            st.warning("Rolling volatility comparison data is temporarily unavailable. Try refreshing the app.")
         st.markdown("---")
         st.subheader("Rolling 12-Month Return")
 
@@ -1012,45 +1071,51 @@ if page == "Portfolio Analysis":
             "Rolling 12-Month Return": rolling_return.values
         }).dropna()
 
-        fig = px.line(
-            rolling_return_df,
-            x="Date",
-            y="Rolling 12-Month Return",
-            title="Rolling 12-Month Portfolio Return",
-            color_discrete_map=COLOR_MAP
-        )
+        if has_chart_data(rolling_return_df[["Rolling 12-Month Return"]]):
+            fig = px.line(
+                rolling_return_df,
+                x="Date",
+                y="Rolling 12-Month Return",
+                title="Rolling 12-Month Portfolio Return",
+                color_discrete_map=COLOR_MAP
+            )
 
-        st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(fig, use_container_width=True)
+        else:
+            st.warning("Rolling 12-month return data is temporarily unavailable. Try refreshing the app.")
         st.markdown("---")
         st.subheader("Annual Return Comparison")
 
-        annual_returns_comparison = growth_df.pct_change().resample("YE").apply(
-            lambda x: (1 + x).prod() - 1
-        )
+        if has_chart_data(growth_df) and isinstance(growth_df.index, pd.DatetimeIndex):
+            annual_returns_comparison = growth_df.pct_change().resample("YE").apply(
+                lambda x: (1 + x).prod() - 1
+            )
 
-        annual_returns_comparison.index = annual_returns_comparison.index.year
+            annual_returns_comparison.index = annual_returns_comparison.index.year
 
-        annual_returns_display = annual_returns_comparison.copy()
+            annual_returns_display = annual_returns_comparison.copy()
 
-        for col in annual_returns_display.columns:
-            annual_returns_display[col] = annual_returns_display[col].map(format_percent)
+            for col in annual_returns_display.columns:
+                annual_returns_display[col] = annual_returns_display[col].map(format_percent)
 
-        def color_annual_returns(val):
-            if isinstance(val, str) and val.startswith("-"):
-                return "color: #EF4444; font-weight: 700;"
-            if isinstance(val, str) and val.endswith("%"):
-                return "color: #22C55E; font-weight: 700;"
-            return ""
+            def color_annual_returns(val):
+                if isinstance(val, str) and val.startswith("-"):
+                    return "color: #EF4444; font-weight: 700;"
+                if isinstance(val, str) and val.endswith("%"):
+                    return "color: #22C55E; font-weight: 700;"
+                return ""
 
-        styled_annual_returns = annual_returns_display.style.map(
-            color_annual_returns,
-            subset=["Selected Portfolio", "SPY", "60/40 Portfolio"]
-        )
+            styled_annual_returns = annual_returns_display.style.map(
+                color_annual_returns,
+                subset=["Selected Portfolio", "SPY", "60/40 Portfolio"]
+            )
 
-        st.dataframe(
-            styled_annual_returns,
-            use_container_width=True
-        )
+            st.dataframe(
+                styled_annual_returns,
+                use_container_width=True
+            )
+        else:
+            st.warning("Annual return comparison data is temporarily unavailable. Try refreshing the app.")
         st.markdown("---")
         st.subheader("Risk / Return Positioning")
 
@@ -1081,22 +1146,24 @@ if page == "Portfolio Analysis":
         benchmark_tickers = ["SPY", "AGG"]
         benchmark_returns_stress = load_benchmark_returns(benchmark_tickers)
 
-        spy_returns_stress = benchmark_returns_stress["SPY"]
-
-        sixty_forty_returns_stress = (
-            benchmark_returns_stress["SPY"] * 0.60 +
-            benchmark_returns_stress["AGG"] * 0.40
+        spy_returns_stress = get_return_series(benchmark_returns_stress, "SPY")
+        sixty_forty_returns_stress = calculate_portfolio_returns(
+            benchmark_returns_stress,
+            pd.Series({"SPY": 0.60, "AGG": 0.40})
         )
 
         scenario_periods = {
             "COVID Shock": ("2020-02-19", "2020-04-30"),
             "2022 Inflation / Rate Shock": ("2022-01-03", "2022-10-14"),
-            "2023 Risk-On Recovery": ("2023-01-03", "2023-12-29"),
-            "Last 12 Months": (
-                str(portfolio_returns.index.max() - pd.DateOffset(months=12))[:10],
-                str(portfolio_returns.index.max())[:10]
-            )
+            "2023 Risk-On Recovery": ("2023-01-03", "2023-12-29")
         }
+
+        if not portfolio_returns.empty:
+            latest_portfolio_date = portfolio_returns.index.max()
+            scenario_periods["Last 12 Months"] = (
+                str(latest_portfolio_date - pd.DateOffset(months=12))[:10],
+                str(latest_portfolio_date)[:10]
+            )
 
         def scenario_stats(return_series, start, end):
             scenario_returns = return_series.loc[start:end]

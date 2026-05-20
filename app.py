@@ -8,14 +8,31 @@ import requests
 import os
 from dotenv import load_dotenv
 from pathlib import Path
+from requests.exceptions import RequestException
 
 env_path = Path(__file__).parent / ".env"
 load_dotenv(dotenv_path=env_path)
 
 ALPHA_VANTAGE_API_KEY = os.getenv("ALPHA_VANTAGE_API_KEY")
+MARKET_DATA_START = "2015-01-01"
+DOWNLOAD_RETRIES = 3
+DOWNLOAD_TIMEOUT = 30
+MONTE_CARLO_SEEDS = {
+    "Conservative Income": 101,
+    "Balanced Growth": 202,
+    "Growth-Oriented": 303
+}
+
+
+def empty_market_news_frame():
+    return pd.DataFrame(columns=["title", "source", "url", "time", "summary"])
+
 
 @st.cache_data(ttl=21600)
 def get_market_news():
+    if not ALPHA_VANTAGE_API_KEY:
+        return empty_market_news_frame()
+
     params = {
         "function": "NEWS_SENTIMENT",
         "topics": "financial_markets",
@@ -24,12 +41,17 @@ def get_market_news():
         "apikey": ALPHA_VANTAGE_API_KEY
     }
 
-    response = requests.get(
-        "https://www.alphavantage.co/query",
-        params=params
-    )
+    try:
+        response = requests.get(
+            "https://www.alphavantage.co/query",
+            params=params,
+            timeout=15
+        )
+        response.raise_for_status()
+        data = response.json()
+    except (RequestException, ValueError):
+        return empty_market_news_frame()
 
-    data = response.json()
 
     articles = []
     backup_articles = []
@@ -67,6 +89,9 @@ def get_market_news():
                 break
 
     articles = articles + backup_articles
+
+    if not articles:
+        return empty_market_news_frame()
 
     return pd.DataFrame(articles[:10])
 
@@ -138,30 +163,93 @@ COLOR_MAP = {
 # Data Functions
 # ---------------------------------------------------
 
+
+def normalize_close_prices(downloaded_data, requested_tickers):
+    if downloaded_data is None or downloaded_data.empty:
+        return pd.DataFrame(columns=requested_tickers)
+
+    if isinstance(downloaded_data.columns, pd.MultiIndex):
+        if "Close" not in downloaded_data.columns.get_level_values(0):
+            return pd.DataFrame(columns=requested_tickers)
+        close_prices = downloaded_data["Close"]
+    elif "Close" in downloaded_data.columns:
+        close_prices = downloaded_data["Close"]
+    else:
+        close_prices = downloaded_data
+
+    if isinstance(close_prices, pd.Series):
+        ticker = requested_tickers[0] if len(requested_tickers) == 1 else close_prices.name
+        close_prices = close_prices.to_frame(name=ticker)
+
+    close_prices = close_prices.copy()
+    close_prices.columns = [str(col) for col in close_prices.columns]
+    close_prices = close_prices.reindex(columns=requested_tickers)
+    close_prices = close_prices.apply(pd.to_numeric, errors="coerce")
+    close_prices = close_prices.replace([np.inf, -np.inf], np.nan)
+    close_prices = close_prices.dropna(how="all").ffill()
+
+    return close_prices.dropna(how="all")
+
+
+def download_close_prices(requested_tickers, start=None, period=None):
+    requested_tickers = list(requested_tickers)
+
+    for _ in range(DOWNLOAD_RETRIES):
+        try:
+            downloaded_data = yf.download(
+                requested_tickers,
+                start=start,
+                period=period,
+                auto_adjust=True,
+                progress=False,
+                threads=False,
+                timeout=DOWNLOAD_TIMEOUT
+            )
+        except Exception:
+            continue
+
+        close_prices = normalize_close_prices(downloaded_data, requested_tickers)
+
+        if not close_prices.empty:
+            return close_prices
+
+    return pd.DataFrame(columns=requested_tickers)
+
+
+def clean_returns(prices):
+    if prices.empty:
+        return pd.DataFrame(columns=prices.columns)
+
+    returns = prices.pct_change(fill_method=None)
+    returns = returns.replace([np.inf, -np.inf], np.nan).dropna(how="all")
+
+    return returns.dropna(axis=1, how="all")
+
+
+def build_correlation_matrix(returns, tickers):
+    if returns.empty:
+        return pd.DataFrame(np.eye(len(tickers)), index=tickers, columns=tickers)
+
+    corr = returns.corr().reindex(index=tickers, columns=tickers)
+    corr = corr.replace([np.inf, -np.inf], np.nan)
+    corr = corr.fillna(0.0).clip(lower=-1.0, upper=1.0)
+    np.fill_diagonal(corr.values, 1.0)
+
+    return corr
+
+
 @st.cache_data(ttl=86400)
 def load_data(tickers):
-    prices = yf.download(
-        tickers,
-        start="2015-01-01",
-        auto_adjust=True,
-        progress=False
-    )["Close"]
-
-    prices = prices.dropna()
-    returns = prices.pct_change().dropna()
-    historical_corr = returns.corr()
+    prices = download_close_prices(tickers, start=MARKET_DATA_START)
+    returns = clean_returns(prices).reindex(columns=tickers)
+    historical_corr = build_correlation_matrix(returns, tickers)
 
     return prices, returns, historical_corr
 
 
 @st.cache_data(ttl=3600)
 def load_market_snapshot(market_tickers):
-    data = yf.download(
-        list(market_tickers.values()),
-        period="1y",
-        auto_adjust=True,
-        progress=False
-    )["Close"]
+    data = download_close_prices(market_tickers.values(), period="1y")
 
     rows = []
 
@@ -189,12 +277,26 @@ def load_market_snapshot(market_tickers):
             "YTD Change": ytd_change
         })
 
-    return pd.DataFrame(rows)
+    return pd.DataFrame(
+        rows,
+        columns=["Market Indicator", "Ticker", "Latest", "1D Change", "YTD Change"]
+    )
 
 
-def split_with_caps(total_weight, assets, max_single_weight):
+@st.cache_data(ttl=86400)
+def load_benchmark_returns(benchmark_tickers):
+    benchmark_prices = download_close_prices(
+        benchmark_tickers,
+        start=MARKET_DATA_START
+    )
+    benchmark_returns = clean_returns(benchmark_prices).reindex(columns=benchmark_tickers)
+
+    return benchmark_returns
+
+
+def split_with_caps(total_weight, assets, max_single_weight, rng):
     for _ in range(1000):
-        raw = np.random.dirichlet(np.ones(len(assets)))
+        raw = rng.dirichlet(np.ones(len(assets)))
         weights = raw * total_weight
 
         if weights.max() <= max_single_weight:
@@ -207,6 +309,10 @@ def split_with_caps(total_weight, assets, max_single_weight):
 @st.cache_data(ttl=86400)
 def run_simulation(profile, expected_returns, strategic_cov_matrix, tickers, num_portfolios, risk_free_rate):
     results = []
+    rng = np.random.default_rng(MONTE_CARLO_SEEDS[profile])
+    expected_returns = expected_returns.reindex(tickers).astype(float)
+    cov_values = strategic_cov_matrix.reindex(index=tickers, columns=tickers).values
+    cov_values = np.nan_to_num(cov_values, nan=0.0, posinf=0.0, neginf=0.0)
 
     equity_assets = ["VTI", "VXUS", "QQQ", "SCHD"]
     bond_cash_assets = ["BND", "IEF", "BIL"]
@@ -215,16 +321,16 @@ def run_simulation(profile, expected_returns, strategic_cov_matrix, tickers, num
     for _ in range(num_portfolios):
 
         if profile == "Conservative Income":
-            equity_weight = np.random.uniform(0.25, 0.35)
-            bond_cash_weight = np.random.uniform(0.55, 0.65)
+            equity_weight = rng.uniform(0.25, 0.35)
+            bond_cash_weight = rng.uniform(0.55, 0.65)
 
         elif profile == "Balanced Growth":
-            equity_weight = np.random.uniform(0.50, 0.65)
-            bond_cash_weight = np.random.uniform(0.25, 0.40)
+            equity_weight = rng.uniform(0.50, 0.65)
+            bond_cash_weight = rng.uniform(0.25, 0.40)
 
         else:
-            equity_weight = np.random.uniform(0.82, 0.92)
-            bond_cash_weight = np.random.uniform(0.03, 0.10)
+            equity_weight = rng.uniform(0.82, 0.92)
+            bond_cash_weight = rng.uniform(0.03, 0.10)
 
         alternatives_weight = 1 - equity_weight - bond_cash_weight
 
@@ -232,9 +338,9 @@ def run_simulation(profile, expected_returns, strategic_cov_matrix, tickers, num
             continue
 
         weights_dict = {}
-        weights_dict.update(split_with_caps(equity_weight, equity_assets, 0.35))
-        weights_dict.update(split_with_caps(bond_cash_weight, bond_cash_assets, 0.35))
-        weights_dict.update(split_with_caps(alternatives_weight, alternative_assets, 0.35))
+        weights_dict.update(split_with_caps(equity_weight, equity_assets, 0.35, rng))
+        weights_dict.update(split_with_caps(bond_cash_weight, bond_cash_assets, 0.35, rng))
+        weights_dict.update(split_with_caps(alternatives_weight, alternative_assets, 0.35, rng))
 
         weights = np.array([weights_dict[t] for t in tickers])
 
@@ -247,13 +353,21 @@ def run_simulation(profile, expected_returns, strategic_cov_matrix, tickers, num
         if weights_dict["GLD"] + weights_dict["VNQ"] < 0.05:
             continue
 
-        portfolio_return = np.dot(weights, expected_returns)
+        portfolio_return = np.dot(weights, expected_returns.values)
 
-        portfolio_volatility = np.sqrt(
-            np.dot(weights.T, np.dot(strategic_cov_matrix.values, weights))
-        )
+        portfolio_variance = np.dot(weights.T, np.dot(cov_values, weights))
 
+        if not np.isfinite(portfolio_return) or not np.isfinite(portfolio_variance):
+            continue
+
+        if portfolio_variance <= 0:
+            continue
+
+        portfolio_volatility = np.sqrt(portfolio_variance)
         sharpe = (portfolio_return - risk_free_rate) / portfolio_volatility
+
+        if not np.isfinite(sharpe):
+            continue
 
         results.append({
             "Expected Return": portfolio_return,
@@ -268,36 +382,79 @@ def run_simulation(profile, expected_returns, strategic_cov_matrix, tickers, num
     return pd.DataFrame(results)
 
 
+def clean_monte_carlo_results(mc_df):
+    if mc_df.empty:
+        return mc_df
+
+    numeric_cols = [
+        "Expected Return",
+        "Expected Volatility",
+        "Sharpe Ratio",
+        "Equity Weight",
+        "Bond/Cash Weight",
+        "Alternatives Weight",
+        *tickers
+    ]
+
+    clean_df = mc_df.copy()
+    clean_df[numeric_cols] = clean_df[numeric_cols].apply(pd.to_numeric, errors="coerce")
+    clean_df = clean_df.replace([np.inf, -np.inf], np.nan)
+
+    finite_mask = np.isfinite(clean_df[numeric_cols]).all(axis=1)
+    clean_df = clean_df.loc[finite_mask]
+    clean_df = clean_df[clean_df["Expected Volatility"] > 0]
+
+    return clean_df
+
+
 def select_profile_portfolio(mc_df, profile):
+    valid_df = clean_monte_carlo_results(mc_df)
+
+    if valid_df.empty:
+        return None
 
     if profile == "Conservative Income":
-        low_vol_cutoff = mc_df["Expected Volatility"].quantile(0.35)
-        candidates = mc_df[mc_df["Expected Volatility"] <= low_vol_cutoff]
-        selected = candidates.sort_values("Sharpe Ratio", ascending=False).iloc[0]
+        low_vol_cutoff = valid_df["Expected Volatility"].quantile(0.35)
+        candidates = valid_df[valid_df["Expected Volatility"] <= low_vol_cutoff]
 
     elif profile == "Balanced Growth":
-        lower = mc_df["Expected Volatility"].quantile(0.35)
-        upper = mc_df["Expected Volatility"].quantile(0.75)
+        lower = valid_df["Expected Volatility"].quantile(0.35)
+        upper = valid_df["Expected Volatility"].quantile(0.75)
 
-        candidates = mc_df[
-            (mc_df["Expected Volatility"] >= lower) &
-            (mc_df["Expected Volatility"] <= upper)
+        candidates = valid_df[
+            (valid_df["Expected Volatility"] >= lower) &
+            (valid_df["Expected Volatility"] <= upper)
         ]
 
-        selected = candidates.sort_values("Sharpe Ratio", ascending=False).iloc[0]
-
     else:
-        high_vol_cutoff = mc_df["Expected Volatility"].quantile(0.75)
-        candidates = mc_df[mc_df["Expected Volatility"] >= high_vol_cutoff]
-        selected = candidates.sort_values("Sharpe Ratio", ascending=False).iloc[0]
+        high_vol_cutoff = valid_df["Expected Volatility"].quantile(0.75)
+        candidates = valid_df[valid_df["Expected Volatility"] >= high_vol_cutoff]
+
+    if candidates.empty:
+        candidates = valid_df
+
+    selected = candidates.sort_values(
+        ["Sharpe Ratio", "Expected Return"],
+        ascending=[False, False],
+        kind="mergesort"
+    ).iloc[0]
 
     return selected
 
 
 def performance_metrics(r, risk_free_rate):
+    r = pd.Series(r).replace([np.inf, -np.inf], np.nan).dropna()
+
+    if r.empty:
+        return [np.nan, np.nan, np.nan, np.nan]
+
     annual_return = (1 + r.mean()) ** 252 - 1
     annual_vol = r.std() * np.sqrt(252)
-    sharpe = (annual_return - risk_free_rate) / annual_vol
+
+    if np.isfinite(annual_vol) and annual_vol > 0:
+        sharpe = (annual_return - risk_free_rate) / annual_vol
+    else:
+        sharpe = np.nan
 
     cumulative = (1 + r).cumprod()
     rolling_max = cumulative.cummax()
@@ -305,6 +462,78 @@ def performance_metrics(r, risk_free_rate):
     max_dd = drawdown.min()
 
     return [annual_return, annual_vol, sharpe, max_dd]
+
+
+def calculate_portfolio_returns(returns, weights):
+    weights = pd.to_numeric(weights, errors="coerce")
+    returns = returns.reindex(columns=weights.index).replace([np.inf, -np.inf], np.nan)
+
+    usable_assets = returns.columns[
+        returns.notna().any() &
+        weights.replace([np.inf, -np.inf], np.nan).notna()
+    ]
+
+    if len(usable_assets) == 0:
+        return pd.Series(dtype=float)
+
+    usable_weights = weights.loc[usable_assets]
+    usable_weights = usable_weights[usable_weights > 0]
+
+    if usable_weights.empty or usable_weights.sum() <= 0:
+        return pd.Series(dtype=float)
+
+    usable_weights = usable_weights / usable_weights.sum()
+    usable_returns = returns.loc[:, usable_weights.index]
+    portfolio_returns = usable_returns.mul(usable_weights, axis=1).sum(axis=1, min_count=1)
+
+    return portfolio_returns.replace([np.inf, -np.inf], np.nan).dropna()
+
+
+def calculate_growth_and_drawdown(portfolio_returns):
+    if portfolio_returns.empty:
+        empty_series = pd.Series(dtype=float)
+        return empty_series, empty_series
+
+    growth = (1 + portfolio_returns).cumprod() * 10000
+    drawdown = growth / growth.cummax() - 1
+
+    return growth, drawdown
+
+
+def get_return_series(returns, ticker):
+    if ticker not in returns.columns:
+        return pd.Series(dtype=float)
+
+    return returns[ticker].replace([np.inf, -np.inf], np.nan).dropna()
+
+
+def prepare_chart_dataframe(data):
+    chart_df = pd.DataFrame(data)
+    chart_df = chart_df.apply(pd.to_numeric, errors="coerce")
+
+    return chart_df.dropna(how="all")
+
+
+def has_chart_data(chart_df):
+    return not chart_df.empty and chart_df.notna().any().any()
+
+
+def is_finite_number(value):
+    return pd.notna(value) and np.isfinite(value)
+
+
+def format_percent(value):
+    if not is_finite_number(value):
+        return "N/A"
+
+    return f"{value:.2%}"
+
+
+def format_number(value):
+    if not is_finite_number(value):
+        return "N/A"
+
+    return f"{value:.2f}"
 
 
 # ---------------------------------------------------
@@ -376,17 +605,27 @@ if page == "Portfolio Analysis":
         num_portfolios,
         risk_free_rate
     )
+    mc_df = clean_monte_carlo_results(mc_df)
 
     if mc_df.empty:
-        st.error("No portfolios matched the current constraints.")
+        st.error("No valid portfolios matched the current constraints. Try refreshing the app.")
         st.stop()
 
     selected = select_profile_portfolio(mc_df, profile)
-    weights = selected[tickers]
+    if selected is None:
+        st.error("No valid portfolios matched the current constraints. Try refreshing the app.")
+        st.stop()
 
-    portfolio_returns = returns.dot(weights)
-    growth = (1 + portfolio_returns).cumprod() * 10000
-    drawdown = growth / growth.cummax() - 1
+    weights = pd.to_numeric(selected[tickers], errors="coerce")
+
+    if weights.isna().any() or not np.isfinite(weights).all() or weights.sum() <= 0:
+        st.error("The selected portfolio weights could not be calculated. Try refreshing the app.")
+        st.stop()
+
+    weights = weights / weights.sum()
+
+    portfolio_returns = calculate_portfolio_returns(returns, weights)
+    growth, drawdown = calculate_growth_and_drawdown(portfolio_returns)
 
     rolling_vol = portfolio_returns.rolling(63).std() * np.sqrt(252)
     rolling_return = portfolio_returns.rolling(252).apply(lambda x: (1 + x).prod() - 1)
@@ -397,19 +636,19 @@ if page == "Portfolio Analysis":
 
     with m1:
         with st.container(border=True):
-            st.metric("Expected Annual Return", f"{selected['Expected Return']:.2%}")
+            st.metric("Expected Annual Return", format_percent(selected["Expected Return"]))
 
     with m2:
         with st.container(border=True):
-            st.metric("Expected Volatility", f"{selected['Expected Volatility']:.2%}")
+            st.metric("Expected Volatility", format_percent(selected["Expected Volatility"]))
 
     with m3:
         with st.container(border=True):
-            st.metric("Sharpe Ratio", f"{selected['Sharpe Ratio']:.2f}")
+            st.metric("Sharpe Ratio", format_number(selected["Sharpe Ratio"]))
 
     with m4:
         with st.container(border=True):
-            st.metric("Historical Max Drawdown", f"{drawdown.min():.2%}")
+            st.metric("Historical Max Drawdown", format_percent(drawdown.min()))
 
     tab0, tab1, tab2, tab3, tab_stress, tab_outlook, tab4, tab5 = st.tabs([
     "Executive Summary",
@@ -474,9 +713,9 @@ if page == "Portfolio Analysis":
 
         st.write(
             f"""
-            This portfolio targets an expected annual return of **{selected['Expected Return']:.2%}**
-            with expected volatility of **{selected['Expected Volatility']:.2%}**.
-            The historical max drawdown for this selected allocation was **{drawdown.min():.2%}**.
+            This portfolio targets an expected annual return of **{format_percent(selected['Expected Return'])}**
+            with expected volatility of **{format_percent(selected['Expected Volatility'])}**.
+            The historical max drawdown for this selected allocation was **{format_percent(drawdown.min())}**.
             """
         )
         st.markdown("---")
@@ -676,48 +915,40 @@ if page == "Portfolio Analysis":
         )
 
         benchmark_tickers = ["SPY", "AGG"]
+        benchmark_returns = load_benchmark_returns(benchmark_tickers)
 
-        benchmark_prices = yf.download(
-            benchmark_tickers,
-            start="2015-01-01",
-            auto_adjust=True,
-            progress=False
-        )["Close"]
+        portfolio_returns_bt = calculate_portfolio_returns(returns, weights)
 
-        benchmark_returns = benchmark_prices.pct_change().dropna()
-        benchmark_returns.columns = benchmark_tickers
-
-        aligned_returns = returns[weights.index].dropna()
-        portfolio_returns_bt = aligned_returns.dot(weights)
-
-        spy_returns = benchmark_returns["SPY"]
-
-        sixty_forty_returns = (
-            benchmark_returns["SPY"] * 0.60 +
-            benchmark_returns["AGG"] * 0.40
+        spy_returns = get_return_series(benchmark_returns, "SPY")
+        sixty_forty_returns = calculate_portfolio_returns(
+            benchmark_returns,
+            pd.Series({"SPY": 0.60, "AGG": 0.40})
         )
 
         portfolio_growth = (1 + portfolio_returns_bt).cumprod() * 10000
         spy_growth = (1 + spy_returns).cumprod() * 10000
         sixty_growth = (1 + sixty_forty_returns).cumprod() * 10000
 
-        growth_df = pd.DataFrame({
+        growth_df = prepare_chart_dataframe({
             "Selected Portfolio": portfolio_growth,
             "SPY": spy_growth,
             "60/40 Portfolio": sixty_growth
-        }).dropna()
+        })
 
-        fig_growth = px.line(
-            growth_df,
-            title="Growth of $10,000",
-            color_discrete_map={
-        "Selected Portfolio": "#38BDF8",
-        "SPY": "#22C55E",
-        "60/40 Portfolio": "#F97316"
-    }
-)
+        if has_chart_data(growth_df):
+            fig_growth = px.line(
+                growth_df,
+                title="Growth of $10,000",
+                color_discrete_map={
+            "Selected Portfolio": "#38BDF8",
+            "SPY": "#22C55E",
+            "60/40 Portfolio": "#F97316"
+        }
+    )
 
-        st.plotly_chart(fig_growth, use_container_width=True)
+            st.plotly_chart(fig_growth, use_container_width=True)
+        else:
+            st.warning("Historical growth data is temporarily unavailable. Try refreshing the app.")
 
         metrics_df = pd.DataFrame(
             {
@@ -735,21 +966,13 @@ if page == "Portfolio Analysis":
 
         metrics_display = metrics_df.copy()
 
-        metrics_display["Annual Return"] = (
-            metrics_display["Annual Return"] * 100
-        ).map("{:.2f}%".format)
+        metrics_display["Annual Return"] = metrics_display["Annual Return"].map(format_percent)
 
-        metrics_display["Volatility"] = (
-            metrics_display["Volatility"] * 100
-        ).map("{:.2f}%".format)
+        metrics_display["Volatility"] = metrics_display["Volatility"].map(format_percent)
 
-        metrics_display["Sharpe Ratio"] = (
-            metrics_display["Sharpe Ratio"]
-        ).map("{:.2f}".format)
+        metrics_display["Sharpe Ratio"] = metrics_display["Sharpe Ratio"].map(format_number)
 
-        metrics_display["Max Drawdown"] = (
-            metrics_display["Max Drawdown"] * 100
-        ).map("{:.2f}%".format)
+        metrics_display["Max Drawdown"] = metrics_display["Max Drawdown"].map(format_percent)
         st.markdown("---")
         st.subheader("Benchmark Comparison")
 
@@ -762,31 +985,29 @@ if page == "Portfolio Analysis":
             return "color: #22C55E; font-weight: 700;"
 
 
-        drawdown_values = (
-            metrics_display["Max Drawdown"]
-            .str.replace("%", "")
-            .astype(float)
+        drawdown_values = pd.to_numeric(
+            metrics_display["Max Drawdown"].str.replace("%", ""),
+            errors="coerce"
         )
 
-        worst_drawdown = drawdown_values.min()
-        best_drawdown = drawdown_values.max()
+        drawdown_rank = drawdown_values.rank(method="first", ascending=True)
+        drawdown_color_map = {}
+        drawdown_palette = ["#991B1B", "#EF4444", "#FCA5A5"]
 
-
-        drawdown_rank = (
-            metrics_display["Max Drawdown"]
-            .str.replace("%", "")
-            .astype(float)
-            .rank(method="first", ascending=True)
-        )
-
-        drawdown_color_map = {
-            drawdown_rank.index[drawdown_rank == 1][0]: "#991B1B",  # worst
-            drawdown_rank.index[drawdown_rank == 2][0]: "#EF4444",  # middle
-            drawdown_rank.index[drawdown_rank == 3][0]: "#FCA5A5"   # best
-        }
+        for rank, color in enumerate(drawdown_palette, start=1):
+            ranked_index = drawdown_rank.index[drawdown_rank == rank]
+            if len(ranked_index) > 0:
+                drawdown_color_map[ranked_index[0]] = color
 
         def color_drawdown_relative(val):
-            row_label = metrics_display[metrics_display["Max Drawdown"] == val].index[0]
+            if val == "N/A":
+                return ""
+
+            matches = metrics_display[metrics_display["Max Drawdown"] == val]
+            if matches.empty:
+                return ""
+
+            row_label = matches.index[0]
             color = drawdown_color_map.get(row_label, "#EF4444")
             return f"color: {color}; font-weight: 800;"
 
@@ -817,25 +1038,31 @@ if page == "Portfolio Analysis":
 
         drawdown_comparison = growth_df / growth_df.cummax() - 1
 
-        fig_drawdown = px.line(
-            drawdown_comparison,
-            title="Drawdown Comparison",
-            color_discrete_map=COLOR_MAP
-        )
+        if has_chart_data(drawdown_comparison):
+            fig_drawdown = px.line(
+                drawdown_comparison,
+                title="Drawdown Comparison",
+                color_discrete_map=COLOR_MAP
+            )
 
-        st.plotly_chart(fig_drawdown, use_container_width=True)
+            st.plotly_chart(fig_drawdown, use_container_width=True)
+        else:
+            st.warning("Drawdown comparison data is temporarily unavailable. Try refreshing the app.")
         st.markdown("---")
         st.subheader("Rolling Volatility Comparison")
 
         rolling_vol_comparison = growth_df.pct_change().rolling(63).std() * np.sqrt(252)
 
-        fig_rolling_vol = px.line(
-            rolling_vol_comparison,
-            title="Rolling 3-Month Annualized Volatility",
-            color_discrete_map=COLOR_MAP
-        )
+        if has_chart_data(rolling_vol_comparison):
+            fig_rolling_vol = px.line(
+                rolling_vol_comparison,
+                title="Rolling 3-Month Annualized Volatility",
+                color_discrete_map=COLOR_MAP
+            )
         
-        st.plotly_chart(fig_rolling_vol, use_container_width=True)
+            st.plotly_chart(fig_rolling_vol, use_container_width=True)
+        else:
+            st.warning("Rolling volatility comparison data is temporarily unavailable. Try refreshing the app.")
         st.markdown("---")
         st.subheader("Rolling 12-Month Return")
 
@@ -844,45 +1071,51 @@ if page == "Portfolio Analysis":
             "Rolling 12-Month Return": rolling_return.values
         }).dropna()
 
-        fig = px.line(
-            rolling_return_df,
-            x="Date",
-            y="Rolling 12-Month Return",
-            title="Rolling 12-Month Portfolio Return",
-            color_discrete_map=COLOR_MAP
-        )
+        if has_chart_data(rolling_return_df[["Rolling 12-Month Return"]]):
+            fig = px.line(
+                rolling_return_df,
+                x="Date",
+                y="Rolling 12-Month Return",
+                title="Rolling 12-Month Portfolio Return",
+                color_discrete_map=COLOR_MAP
+            )
 
-        st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(fig, use_container_width=True)
+        else:
+            st.warning("Rolling 12-month return data is temporarily unavailable. Try refreshing the app.")
         st.markdown("---")
         st.subheader("Annual Return Comparison")
 
-        annual_returns_comparison = growth_df.pct_change().resample("YE").apply(
-            lambda x: (1 + x).prod() - 1
-        )
+        if has_chart_data(growth_df) and isinstance(growth_df.index, pd.DatetimeIndex):
+            annual_returns_comparison = growth_df.pct_change().resample("YE").apply(
+                lambda x: (1 + x).prod() - 1
+            )
 
-        annual_returns_comparison.index = annual_returns_comparison.index.year
+            annual_returns_comparison.index = annual_returns_comparison.index.year
 
-        annual_returns_display = annual_returns_comparison.copy()
+            annual_returns_display = annual_returns_comparison.copy()
 
-        for col in annual_returns_display.columns:
-            annual_returns_display[col] = annual_returns_display[col].map(lambda x: f"{x:.2%}")
+            for col in annual_returns_display.columns:
+                annual_returns_display[col] = annual_returns_display[col].map(format_percent)
 
-        def color_annual_returns(val):
-            if isinstance(val, str) and val.startswith("-"):
-                return "color: #EF4444; font-weight: 700;"
-            if isinstance(val, str) and val.endswith("%"):
-                return "color: #22C55E; font-weight: 700;"
-            return ""
+            def color_annual_returns(val):
+                if isinstance(val, str) and val.startswith("-"):
+                    return "color: #EF4444; font-weight: 700;"
+                if isinstance(val, str) and val.endswith("%"):
+                    return "color: #22C55E; font-weight: 700;"
+                return ""
 
-        styled_annual_returns = annual_returns_display.style.map(
-            color_annual_returns,
-            subset=["Selected Portfolio", "SPY", "60/40 Portfolio"]
-        )
+            styled_annual_returns = annual_returns_display.style.map(
+                color_annual_returns,
+                subset=["Selected Portfolio", "SPY", "60/40 Portfolio"]
+            )
 
-        st.dataframe(
-            styled_annual_returns,
-            use_container_width=True
-        )
+            st.dataframe(
+                styled_annual_returns,
+                use_container_width=True
+            )
+        else:
+            st.warning("Annual return comparison data is temporarily unavailable. Try refreshing the app.")
         st.markdown("---")
         st.subheader("Risk / Return Positioning")
 
@@ -911,33 +1144,26 @@ if page == "Portfolio Analysis":
         )
 
         benchmark_tickers = ["SPY", "AGG"]
+        benchmark_returns_stress = load_benchmark_returns(benchmark_tickers)
 
-        benchmark_prices_stress = yf.download(
-            benchmark_tickers,
-            start="2015-01-01",
-            auto_adjust=True,
-            progress=False
-        )["Close"]
-
-        benchmark_returns_stress = benchmark_prices_stress.pct_change().dropna()
-        benchmark_returns_stress.columns = benchmark_tickers
-
-        spy_returns_stress = benchmark_returns_stress["SPY"]
-
-        sixty_forty_returns_stress = (
-            benchmark_returns_stress["SPY"] * 0.60 +
-            benchmark_returns_stress["AGG"] * 0.40
+        spy_returns_stress = get_return_series(benchmark_returns_stress, "SPY")
+        sixty_forty_returns_stress = calculate_portfolio_returns(
+            benchmark_returns_stress,
+            pd.Series({"SPY": 0.60, "AGG": 0.40})
         )
 
         scenario_periods = {
             "COVID Shock": ("2020-02-19", "2020-04-30"),
             "2022 Inflation / Rate Shock": ("2022-01-03", "2022-10-14"),
-            "2023 Risk-On Recovery": ("2023-01-03", "2023-12-29"),
-            "Last 12 Months": (
-                str(portfolio_returns.index.max() - pd.DateOffset(months=12))[:10],
-                str(portfolio_returns.index.max())[:10]
-            )
+            "2023 Risk-On Recovery": ("2023-01-03", "2023-12-29")
         }
+
+        if not portfolio_returns.empty:
+            latest_portfolio_date = portfolio_returns.index.max()
+            scenario_periods["Last 12 Months"] = (
+                str(latest_portfolio_date - pd.DateOffset(months=12))[:10],
+                str(latest_portfolio_date)[:10]
+            )
 
         def scenario_stats(return_series, start, end):
             scenario_returns = return_series.loc[start:end]
@@ -987,13 +1213,16 @@ if page == "Portfolio Analysis":
         ]
 
         for col in percent_cols:
-            display_scenario_df[col] = display_scenario_df[col].map(lambda x: f"{x:.2%}")
+            display_scenario_df[col] = display_scenario_df[col].map(format_percent)
 
         def color_returns(val):
             if not isinstance(val, str) or not val.endswith("%"):
                 return ""
 
-            num = float(val.replace("%", ""))
+            try:
+                num = float(val.replace("%", ""))
+            except ValueError:
+                return ""
 
             if num >= 0:
                 return "color: #22C55E; font-weight: 700;"
@@ -1005,7 +1234,10 @@ if page == "Portfolio Analysis":
             if not isinstance(val, str) or not val.endswith("%"):
                 return ""
 
-            num = float(val.replace("%", ""))
+            try:
+                num = float(val.replace("%", ""))
+            except ValueError:
+                return ""
 
             if num <= -15:
                 return "color: #DC2626; font-weight: 800;"
@@ -1490,9 +1722,11 @@ elif page == "Live Markets":
     market_df = load_market_snapshot(market_tickers)
 
     display_market_df = market_df.copy()
-    display_market_df["Latest"] = display_market_df["Latest"].map(lambda x: f"{x:,.2f}")
-    display_market_df["1D Change"] = display_market_df["1D Change"].map(lambda x: f"{x:.2%}")
-    display_market_df["YTD Change"] = display_market_df["YTD Change"].map(lambda x: f"{x:.2%}")
+    display_market_df["Latest"] = display_market_df["Latest"].map(
+        lambda x: f"{x:,.2f}" if is_finite_number(x) else "N/A"
+    )
+    display_market_df["1D Change"] = display_market_df["1D Change"].map(format_percent)
+    display_market_df["YTD Change"] = display_market_df["YTD Change"].map(format_percent)
 
     st.subheader("Market Snapshot")
 
@@ -1632,22 +1866,13 @@ elif page == "Live Markets":
 
     st.subheader("Market Read-Through")
 
-    equity_return = market_df.loc[
-        market_df["Market Indicator"] == "S&P 500",
-        "YTD Change"
-    ].iloc[0]
+    equity_return = get_market_value(market_df, "S&P 500", "YTD Change")
+    vix_level = get_market_value(market_df, "VIX", "Latest")
+    ten_year_change = get_market_value(market_df, "10Y Treasury Yield", "YTD Change")
 
-    vix_level = market_df.loc[
-        market_df["Market Indicator"] == "VIX",
-        "Latest"
-    ].iloc[0]
-
-    ten_year_change = market_df.loc[
-        market_df["Market Indicator"] == "10Y Treasury Yield",
-        "YTD Change"
-    ].iloc[0]
-
-    if equity_return > 0 and vix_level < 20:
+    if pd.isna(equity_return) or pd.isna(vix_level) or pd.isna(ten_year_change):
+        st.warning("Market read-through could not load enough market data. Try refreshing the app.")
+    elif equity_return > 0 and vix_level < 20:
         st.info(
             "Current market conditions appear broadly risk-on, with positive equity performance "
             "and relatively contained volatility. Growth-oriented portfolios may benefit most in this environment."
@@ -1665,22 +1890,30 @@ elif page == "Live Markets":
 
     st.subheader("Cross-Asset Interpretation")
 
-    interpretation = pd.DataFrame({
-        "Signal": [
-            "Equities",
-            "Rates",
-            "Volatility",
-            "Real Assets",
-            "Portfolio Implication"
-        ],
-        "Current Read": [
-            "Positive YTD equity performance supports risk appetite." if equity_return > 0 else "Negative YTD equity performance suggests weaker risk appetite.",
-            "Rising Treasury yields may pressure bond prices and rate-sensitive equities." if ten_year_change > 0 else "Falling Treasury yields may support bond prices and long-duration assets.",
-            "VIX below 20 suggests calmer markets." if vix_level < 20 else "VIX above 20 suggests elevated uncertainty.",
-            "Gold, oil, and real assets help monitor inflation and geopolitical sensitivity.",
-            "Diversified portfolios can help balance growth, income, inflation exposure, and downside control."
-        ]
-    })
+    if pd.isna(equity_return) or pd.isna(vix_level) or pd.isna(ten_year_change):
+        interpretation = pd.DataFrame({
+            "Signal": ["Portfolio Implication"],
+            "Current Read": [
+                "Live market data is temporarily incomplete; diversified portfolio positioning remains the strategic baseline."
+            ]
+        })
+    else:
+        interpretation = pd.DataFrame({
+            "Signal": [
+                "Equities",
+                "Rates",
+                "Volatility",
+                "Real Assets",
+                "Portfolio Implication"
+            ],
+            "Current Read": [
+                "Positive YTD equity performance supports risk appetite." if equity_return > 0 else "Negative YTD equity performance suggests weaker risk appetite.",
+                "Rising Treasury yields may pressure bond prices and rate-sensitive equities." if ten_year_change > 0 else "Falling Treasury yields may support bond prices and long-duration assets.",
+                "VIX below 20 suggests calmer markets." if vix_level < 20 else "VIX above 20 suggests elevated uncertainty.",
+                "Gold, oil, and real assets help monitor inflation and geopolitical sensitivity.",
+                "Diversified portfolios can help balance growth, income, inflation exposure, and downside control."
+            ]
+        })
 
     st.dataframe(
         interpretation,

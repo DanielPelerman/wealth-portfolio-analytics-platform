@@ -211,9 +211,99 @@ def download_close_prices(requested_tickers, start=None, period=None):
         close_prices = normalize_close_prices(downloaded_data, requested_tickers)
 
         if not close_prices.empty:
-            return close_prices
+            missing_tickers = [
+                ticker for ticker in requested_tickers
+                if ticker not in close_prices.columns or close_prices[ticker].dropna().empty
+            ]
 
-    return pd.DataFrame(columns=requested_tickers)
+            if missing_tickers:
+                fallback_prices = download_chart_api_prices(missing_tickers, start=start, period=period)
+                close_prices = close_prices.combine_first(fallback_prices)
+
+            return close_prices.reindex(columns=requested_tickers)
+
+    return download_chart_api_prices(requested_tickers, start=start, period=period)
+
+
+def download_chart_api_prices(requested_tickers, start=None, period=None):
+    price_series = {}
+
+    for ticker in requested_tickers:
+        series = download_chart_api_price(ticker, start=start, period=period)
+
+        if not series.empty:
+            price_series[ticker] = series
+
+    if not price_series:
+        return pd.DataFrame(columns=requested_tickers)
+
+    prices = pd.DataFrame(price_series)
+    prices = prices.reindex(columns=requested_tickers)
+    prices = prices.replace([np.inf, -np.inf], np.nan)
+
+    return prices.dropna(how="all").ffill()
+
+
+def download_chart_api_price(ticker, start=None, period=None):
+    end_timestamp = int(pd.Timestamp.utcnow().timestamp())
+
+    if start is not None:
+        start_timestamp = int(pd.Timestamp(start).timestamp())
+    elif period == "1y":
+        start_timestamp = int((pd.Timestamp.utcnow() - pd.DateOffset(years=1)).timestamp())
+    else:
+        start_timestamp = int((pd.Timestamp.utcnow() - pd.DateOffset(years=10)).timestamp())
+
+    params = {
+        "period1": start_timestamp,
+        "period2": end_timestamp,
+        "interval": "1d",
+        "includeAdjustedClose": "true"
+    }
+
+    headers = {
+        "User-Agent": "Mozilla/5.0"
+    }
+
+    for host in ["query1.finance.yahoo.com", "query2.finance.yahoo.com"]:
+        try:
+            response = requests.get(
+                f"https://{host}/v8/finance/chart/{ticker}",
+                params=params,
+                headers=headers,
+                timeout=DOWNLOAD_TIMEOUT
+            )
+            response.raise_for_status()
+            data = response.json()
+        except (RequestException, ValueError):
+            continue
+
+        result = data.get("chart", {}).get("result")
+
+        if not result:
+            continue
+
+        timestamps = result[0].get("timestamp", [])
+        indicators = result[0].get("indicators", {})
+        adjclose = indicators.get("adjclose", [{}])[0].get("adjclose")
+        close = indicators.get("quote", [{}])[0].get("close")
+        values = adjclose if adjclose is not None else close
+
+        if not timestamps or not values:
+            continue
+
+        series = pd.Series(
+            values,
+            index=pd.to_datetime(timestamps, unit="s"),
+            name=ticker
+        )
+        series = pd.to_numeric(series, errors="coerce")
+        series = series.replace([np.inf, -np.inf], np.nan).dropna()
+
+        if not series.empty:
+            return series
+
+    return pd.Series(dtype=float, name=ticker)
 
 
 def clean_returns(prices):
@@ -516,6 +606,13 @@ def prepare_chart_dataframe(data):
 
 def has_chart_data(chart_df):
     return not chart_df.empty and chart_df.notna().any().any()
+
+
+def style_map(styler, func, subset):
+    if hasattr(styler, "map"):
+        return styler.map(func, subset=subset)
+
+    return styler.applymap(func, subset=subset)
 
 
 def is_finite_number(value):
@@ -1012,16 +1109,14 @@ if page == "Portfolio Analysis":
             return f"color: {color}; font-weight: 800;"
 
 
-        styled_metrics = (
-            metrics_display.style
-            .map(
+        styled_metrics = style_map(
+            style_map(
+                metrics_display.style,
                 color_positive_negative_pct,
                 subset=["Annual Return", "Volatility"]
-            )
-            .map(
-                color_drawdown_relative,
-                subset=["Max Drawdown"]
-            )
+            ),
+            color_drawdown_relative,
+            subset=["Max Drawdown"]
         )
 
         st.dataframe(
@@ -1105,7 +1200,8 @@ if page == "Portfolio Analysis":
                     return "color: #22C55E; font-weight: 700;"
                 return ""
 
-            styled_annual_returns = annual_returns_display.style.map(
+            styled_annual_returns = style_map(
+                annual_returns_display.style,
                 color_annual_returns,
                 subset=["Selected Portfolio", "SPY", "60/40 Portfolio"]
             )
@@ -1247,24 +1343,22 @@ if page == "Portfolio Analysis":
                 return "color: #F87171; font-weight: 700;"
 
 
-        styled_scenario_df = (
-            display_scenario_df.style
-            .map(
+        styled_scenario_df = style_map(
+            style_map(
+                display_scenario_df.style,
                 color_returns,
                 subset=[
                     "Selected Portfolio Return",
                     "SPY Return",
                     "60/40 Return"
                 ]
-            )
-            .map(
-                color_drawdowns,
-                subset=[
-                    "Selected Portfolio Max Drawdown",
-                    "SPY Max Drawdown",
-                    "60/40 Max Drawdown"
-                ]
-            )
+            ),
+            color_drawdowns,
+            subset=[
+                "Selected Portfolio Max Drawdown",
+                "SPY Max Drawdown",
+                "60/40 Max Drawdown"
+            ]
         )
 
         st.dataframe(
@@ -1735,7 +1829,8 @@ elif page == "Live Markets":
             return "color: #EF4444; font-weight: 700;"
         return "color: #22C55E; font-weight: 700;"
 
-    styled_market_df = display_market_df.style.map(
+    styled_market_df = style_map(
+        display_market_df.style,
         color_positive_negative,
         subset=["1D Change", "YTD Change"]
     )
@@ -1837,7 +1932,8 @@ elif page == "Live Markets":
                 return "color: #F59E0B; font-weight: 700;"
             return ""
 
-        styled_regime_df = regime_df.style.map(
+        styled_regime_df = style_map(
+            regime_df.style,
             color_regime_signal,
             subset=["Current Read"]
         )

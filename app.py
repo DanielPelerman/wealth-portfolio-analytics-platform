@@ -17,6 +17,7 @@ ALPHA_VANTAGE_API_KEY = os.getenv("ALPHA_VANTAGE_API_KEY")
 MARKET_DATA_START = "2015-01-01"
 DOWNLOAD_RETRIES = 3
 DOWNLOAD_TIMEOUT = 30
+BUNDLED_HISTORICAL_PRICES_PATH = Path(__file__).parent / "data" / "historical_prices.csv"
 MONTE_CARLO_SEEDS = {
     "Conservative Income": 101,
     "Balanced Growth": 202,
@@ -316,6 +317,26 @@ def clean_returns(prices):
     return returns.dropna(axis=1, how="all")
 
 
+def load_bundled_historical_prices(tickers):
+    if not BUNDLED_HISTORICAL_PRICES_PATH.exists():
+        return pd.DataFrame(columns=tickers)
+
+    try:
+        prices = pd.read_csv(
+            BUNDLED_HISTORICAL_PRICES_PATH,
+            index_col="Date",
+            parse_dates=True
+        )
+    except (OSError, ValueError):
+        return pd.DataFrame(columns=tickers)
+
+    prices = prices.reindex(columns=tickers)
+    prices = prices.apply(pd.to_numeric, errors="coerce")
+    prices = prices.replace([np.inf, -np.inf], np.nan)
+
+    return prices.dropna(how="all").ffill()
+
+
 def build_correlation_matrix(returns, tickers):
     if returns.empty:
         return pd.DataFrame(np.eye(len(tickers)), index=tickers, columns=tickers)
@@ -330,7 +351,18 @@ def build_correlation_matrix(returns, tickers):
 
 @st.cache_data(ttl=86400)
 def load_data(tickers):
-    prices = download_close_prices(tickers, start=MARKET_DATA_START)
+    downloaded_prices = download_close_prices(tickers, start=MARKET_DATA_START)
+    bundled_prices = load_bundled_historical_prices(tickers)
+
+    if downloaded_prices.empty:
+        prices = bundled_prices
+    elif bundled_prices.empty:
+        prices = downloaded_prices
+    else:
+        prices = downloaded_prices.combine_first(bundled_prices)
+
+    prices = prices.reindex(columns=tickers)
+    prices = prices.replace([np.inf, -np.inf], np.nan).dropna(how="all").ffill()
     returns = clean_returns(prices).reindex(columns=tickers)
     historical_corr = build_correlation_matrix(returns, tickers)
 
@@ -1146,7 +1178,7 @@ if page == "Portfolio Analysis":
         st.markdown("---")
         st.subheader("Rolling Volatility Comparison")
 
-        rolling_vol_comparison = growth_df.pct_change().rolling(63).std() * np.sqrt(252)
+        rolling_vol_comparison = growth_df.pct_change(fill_method=None).rolling(63).std() * np.sqrt(252)
 
         if has_chart_data(rolling_vol_comparison):
             fig_rolling_vol = px.line(
@@ -1182,7 +1214,7 @@ if page == "Portfolio Analysis":
         st.subheader("Annual Return Comparison")
 
         if has_chart_data(growth_df) and isinstance(growth_df.index, pd.DatetimeIndex):
-            annual_returns_comparison = growth_df.pct_change().resample("YE").apply(
+            annual_returns_comparison = growth_df.pct_change(fill_method=None).resample("YE").apply(
                 lambda x: (1 + x).prod() - 1
             )
 
